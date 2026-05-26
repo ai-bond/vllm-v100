@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import torch
 
-from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_BLOCK_SIZE
 from vllm.utils.torch_utils import direct_register_custom_op
+
+OCP_MX_BLOCK_SIZE = 32
 
 
 def _quant_dequant_mxfp6(
@@ -35,6 +37,7 @@ def _quant_dequant_mxfp6(
             f"Scale calculation mode {scale_calculation_mode} is not yet "
             "supported in MX-FP6 quantization"
         )
+
     scale = even_round(amax, quant_dtype)
 
     # Apply dequantize(quantize(x)).

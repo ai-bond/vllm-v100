@@ -76,17 +76,13 @@ __all__ = [
 ]
 
 if HAS_TRITON:
-    # import to register the custom ops
-    from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
-        BatchedDeepGemmExperts,
-    )
     from vllm.model_executor.layers.fused_moe.cutlass_moe import (
         CutlassBatchedExpertsFp8,
         CutlassExpertsFp8,
         CutlassExpertsW4A8Fp8,
         cutlass_moe_w4a8_fp8,
     )
-    from vllm.model_executor.layers.fused_moe.deep_gemm_moe import DeepGemmExperts
+
     from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
         BatchedTritonExperts,
     )
@@ -96,25 +92,15 @@ if HAS_TRITON:
         fused_experts,
         get_config_file_name,
     )
-    from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-        AiterExperts,
-    )
+
     from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
         fused_topk,
     )
     from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
         GroupedTopk,
     )
-    from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
-        TritonOrDeepGemmExperts,
-    )
-    from vllm.model_executor.layers.fused_moe.xpu_fused_moe import (
-        XPUExperts,
-        XPUExpertsFp8,
-    )
 
     __all__ += [
-        "AiterExperts",
         "fused_topk",
         "fused_experts",
         "get_config_file_name",
@@ -126,11 +112,6 @@ if HAS_TRITON:
         "TritonExperts",
         "TritonWNA16Experts",
         "BatchedTritonExperts",
-        "DeepGemmExperts",
-        "BatchedDeepGemmExperts",
-        "TritonOrDeepGemmExperts",
-        "XPUExperts",
-        "XPUExpertsFp8",
     ]
 else:
     # Some model classes directly use the custom ops. Add placeholders

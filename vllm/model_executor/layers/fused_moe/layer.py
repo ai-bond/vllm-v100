@@ -9,7 +9,6 @@ import torch
 from torch.nn.parameter import UninitializedParameter
 
 import vllm.envs as envs
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -32,9 +31,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
-)
-from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-    init_aiter_topK_meta_data,
 )
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
@@ -69,8 +65,7 @@ def determine_expert_map(
     global_num_experts: int,
     expert_placement_strategy: ExpertPlacementStrategy = "linear",
     num_fused_shared_experts: int = 0,
-    return_expert_mask: bool = False,
-) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[int, torch.Tensor | None]:
     """
     Calculates how many experts should be assigned to each rank for EP and
     creates a mapping from global to local expert index. Experts are
@@ -92,16 +87,10 @@ def determine_expert_map(
                 (global_num_experts,) mapping from global to local index.
                 Contains -1 for experts not assigned to the current rank.
                 Returns None if ep_size is 1.
-            - expert_mask (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts + num_fused_shared_experts + 1,)
-                containing 1 for experts assigned to the current rank
-                and 0 for sentinel.
-                Returns None if ep_size is 1.
-                Used only when AITER MOE is enabled.
     """
     assert ep_size > 0
     if ep_size == 1:
-        return (global_num_experts, None, None)
+        return (global_num_experts, None)
 
     # Distribute experts as evenly as possible to each rank.
     base_experts = global_num_experts // ep_size
@@ -131,25 +120,7 @@ def determine_expert_map(
             f"{get_args(ExpertPlacementStrategy)}"
         )
 
-    expert_mask = None
-    if return_expert_mask:
-        expert_mask = torch.ones(
-            (global_num_experts + num_fused_shared_experts + 1,), dtype=torch.int32
-        )
-        expert_mask[-1] = 0
-        expert_mask[:global_num_experts] = expert_map > -1
-        expert_map = torch.cat(
-            (
-                expert_map,
-                torch.tensor(
-                    [local_num_experts + i for i in range(num_fused_shared_experts)],
-                    dtype=torch.int32,
-                ),
-            ),
-            dim=0,
-        )
-
-    return (local_num_experts, expert_map, expert_mask)
+    return (local_num_experts, expert_map)
 
 
 def determine_expert_placement_strategy(
@@ -336,29 +307,10 @@ class FusedMoE(CustomOp):
             vllm_config.parallel_config.expert_placement_strategy
         )
 
-        # ROCm aiter shared experts fusion
-        # AITER only supports gated activations (silu/gelu), so disable it
-        # for non-gated MoE (is_act_and_mul=False)
-        self.rocm_aiter_fmoe_enabled = (
-            rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul
-        )
-        self.aiter_fmoe_shared_expert_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and is_act_and_mul
-        )
+        self.rocm_aiter_fmoe_enabled = False
+        self.aiter_fmoe_shared_expert_enabled = False
 
-        self.num_fused_shared_experts = (
-            n_shared_experts
-            if n_shared_experts is not None and self.aiter_fmoe_shared_expert_enabled
-            else 0
-        )
-        if (
-            not self.aiter_fmoe_shared_expert_enabled
-            and self.num_fused_shared_experts != 0
-        ):
-            raise ValueError(
-                "n_shared_experts is only supported on ROCm aiter when "
-                "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled"
-            )
+        self.num_fused_shared_experts = 0
 
         # Determine expert maps
         if self.use_ep:
@@ -381,22 +333,20 @@ class FusedMoE(CustomOp):
             )
 
             self._expert_map: torch.Tensor | None
-            local_num_experts, expert_map, expert_mask = determine_expert_map(
+            local_num_experts, expert_map = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
                 global_num_experts=self.global_num_experts,
                 expert_placement_strategy=self.expert_placement_strategy,
                 num_fused_shared_experts=self.num_fused_shared_experts,
-                return_expert_mask=self.rocm_aiter_fmoe_enabled,
             )
             self.local_num_experts = local_num_experts
             self.register_buffer("_expert_map", expert_map)
-            self.register_buffer("expert_mask", expert_mask)
             self._maybe_init_expert_routing_tables()
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
-                "placement strategy: %s. Local/global"
-                " number of experts: %s/%s. Experts local to global index map:"
+                "placement strategy: %s. Local/global "
+                " number of experts: %s/%s. Experts local to global index map: "
                 " %s.",
                 self.ep_rank,
                 self.ep_size,
@@ -406,20 +356,17 @@ class FusedMoE(CustomOp):
                 get_compressed_expert_map(self._expert_map),
             )
         else:
-            self.local_num_experts, self._expert_map, self.expert_mask = (
+            self.local_num_experts, self._expert_map = (
                 self.global_num_experts,
-                None,
                 None,
             )
 
         self.top_k = top_k
 
-        self._init_aiter_shared_experts_topK_buffer(
-            vllm_config=vllm_config, dp_size=dp_size_
-        )
         if self.use_ep and self.rocm_aiter_fmoe_enabled:
-            assert self.expert_mask is None or torch.all(
-                (expert_mask == 0) | (expert_mask == 1)
+            # ROCm AITER path — disabled in this fork, but kept for completeness
+            assert self._expert_map is None or torch.all(
+                (self._expert_map == -1) | (self._expert_map >= 0)
             ), "Aiter Fused MoE kernel only supports expert_map with 0 and 1s."
 
         assert intermediate_size % self.tp_size == 0
@@ -488,14 +435,6 @@ class FusedMoE(CustomOp):
             # TODO: in_dtype == out_dtype?
             disable_inplace=disable_inplace() or self._shared_experts is not None,
         )
-        if self.moe_config.use_mori_kernels:
-            assert self.rocm_aiter_fmoe_enabled, (
-                "Mori needs to be used with aiter fused_moe for now."
-            )
-            assert not self.aiter_fmoe_shared_expert_enabled, (
-                "Mori does not support fusion shared expert now. "
-                "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"
-            )
 
         self.quant_config = quant_config
 
@@ -760,23 +699,16 @@ class FusedMoE(CustomOp):
         # ep_size and ep_rank should already be updated
         assert self._expert_map is not None
         with self._expert_map.device:
-            local_num_experts, expert_map, expert_mask = determine_expert_map(
+            local_num_experts, expert_map = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
                 global_num_experts=self.global_num_experts,
                 expert_placement_strategy=self.expert_placement_strategy,
                 num_fused_shared_experts=self.num_fused_shared_experts,
-                return_expert_mask=self.rocm_aiter_fmoe_enabled,
             )
             self.local_num_experts = local_num_experts
             self.register_buffer("_expert_map", expert_map)
-            self.register_buffer("expert_mask", expert_mask)
             self._maybe_init_expert_routing_tables()
-            if self.aiter_fmoe_shared_expert_enabled:
-                self._init_aiter_shared_experts_topK_buffer(
-                    vllm_config=get_current_vllm_config(),
-                    dp_size=get_dp_group().world_size,
-                )
 
     def _load_per_tensor_weight_scale(
         self,
@@ -982,23 +914,6 @@ class FusedMoE(CustomOp):
         if self._expert_map is None:
             return expert_id
         return self._expert_map[expert_id].item()
-
-    def _init_aiter_shared_experts_topK_buffer(
-        self, vllm_config: VllmConfig, dp_size: int
-    ):
-        if self.num_fused_shared_experts > 0:
-            init_aiter_topK_meta_data(
-                n_routed_experts=self.global_num_experts,
-                n_shared_experts=self.num_fused_shared_experts,
-                top_k=self.top_k,
-                tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
-                tp_size=self.ep_size if self.use_ep else self.tp_size,
-                shared_experts_score=1.0,
-                max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens
-                * dp_size,
-                is_EP=self.use_ep,
-            )
-        self.local_num_experts += self.num_fused_shared_experts
 
     @overload
     def weight_loader(
@@ -1356,8 +1271,8 @@ class FusedMoE(CustomOp):
               `x_` of shape (E, 16, 32) and stride (512, 32, 1).
               Note that we specifically use torch.transpose() so `x_` refers
               to the same underlying memory. The tensors `x` and `x_`, pointing
-              to the same underlying memory make this transformation safe in the
-              context of EPLB. i.e. It is the same memory and just the view
+              to the same underlying memory make this transformation safe in
+              the context of EPLB. i.e. It is the same memory and just the view
               is different.
             Note: This function handles the "weight_scale" tensors specifically.
             This could however be generalized to handle similar tensors.
@@ -1388,7 +1303,7 @@ class FusedMoE(CustomOp):
 
         # `w13_input_scale` and `w2_input_scale` are global per-tensor
         # activation scales shared across all experts (e.g. NVFP4).
-        # They are broadcast views (stride 0) from .expand() and are
+        # They are broad cast views (stride 0) from .expand() and are
         # not actual expert weights, so exclude them from EPLB.
         NON_EXPERT_WEIGHTS = {
             "e_score_correction_bias",
@@ -1476,9 +1391,7 @@ class FusedMoE(CustomOp):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
-        return (
-            self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
-        )
+        return self._expert_map
 
     def forward_cuda(
         self,

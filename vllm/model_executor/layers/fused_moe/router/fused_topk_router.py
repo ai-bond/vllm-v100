@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from collections.abc import Callable
 
 import torch
 
 import vllm._custom_ops as ops
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
@@ -28,7 +28,6 @@ def vllm_topk_softmax(
         gating_output,
         renormalize,
     )
-
     return topk_weights, topk_indices
 
 
@@ -46,24 +45,7 @@ def vllm_topk_sigmoid(
         gating_output,
         renormalize,
     )
-
     return topk_weights, topk_indices
-
-
-def dispatch_topk_softmax_func(
-    use_rocm_aiter: bool = False,
-) -> Callable[..., tuple[torch.Tensor, ...]]:
-    if use_rocm_aiter:
-        return rocm_aiter_ops.topk_softmax
-    return vllm_topk_softmax
-
-
-def dispatch_topk_sigmoid_func(
-    use_rocm_aiter: bool = False,
-) -> Callable[..., tuple[torch.Tensor, ...]]:
-    if use_rocm_aiter:
-        return rocm_aiter_ops.topk_sigmoid
-    return vllm_topk_sigmoid
 
 
 def fused_topk(
@@ -92,22 +74,14 @@ def fused_topk(
     )
 
     if scoring_func == "softmax":
-        topk_func = dispatch_topk_softmax_func(
-            use_rocm_aiter=rocm_aiter_ops.is_fused_moe_enabled()
-        )
-        topk_weights, topk_ids = topk_func(
+        topk_weights, topk_ids = vllm_topk_softmax(
             topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
         )
-
         return topk_weights, topk_ids, token_expert_indices
     elif scoring_func == "sigmoid":
-        topk_func = dispatch_topk_sigmoid_func(
-            use_rocm_aiter=rocm_aiter_ops.is_fused_moe_enabled()
-        )
-        topk_weights, topk_ids = topk_func(
+        topk_weights, topk_ids = vllm_topk_sigmoid(
             topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
         )
-
         return topk_weights, topk_ids, token_expert_indices
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")

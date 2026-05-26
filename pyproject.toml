@@ -1,5 +1,4 @@
 [build-system]
-# Should be mirrored in requirements/build.txt
 requires = [
     "cmake>=3.26.1",
     "ninja",
@@ -7,17 +6,19 @@ requires = [
     "setuptools>=77.0.3,<81.0.0",
     "setuptools-scm>=8.0",
     "wheel",
-    "jinja2",
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm"
-authors = [{name = "vLLM Team"}]
+version = "0.19.1"
+authors = [
+    {name = "ai-bond (vllm-v100)"},
+    {name = "vLLM Team (upstream)"},
+]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
 classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -28,14 +29,17 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Information Analysis",
+    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.9",
 ]
 requires-python = ">=3.10,<3.14"
-dynamic = [ "version", "dependencies", "optional-dependencies"]
+
+dynamic = ["dependencies", "optional-dependencies"]
 
 [project.urls]
-Homepage="https://github.com/vllm-project/vllm"
-Documentation="https://docs.vllm.ai/en/latest/"
-Slack="https://slack.vllm.ai/"
+Homepage = "https://github.com/ai-bond/vllm-v100"
+Repository = "https://github.com/ai-bond/vllm-v100"
+Issues = "https://github.com/ai-bond/vllm-v100/issues"
+Upstream = "https://github.com/vllm-project/vllm"
 
 [project.scripts]
 vllm = "vllm.entrypoints.cli.main:main"
@@ -97,31 +101,14 @@ ignore_missing_imports = true
 check_untyped_defs = true
 follow_imports = "silent"
 
-[tool.pytest.ini_options]
-markers = [
-    "slow_test",
-    "skip_global_cleanup",
-    "core_model: enable this model test in each PR instead of only nightly",
-    "hybrid_model: models that contain mamba layers (including pure SSM and hybrid architectures)",
-    "cpu_model: enable this model test in CPU tests",
-    "cpu_test: mark test as CPU-only test",
-    "split: run this test as part of a split",
-    "distributed: run this test only in distributed GPU tests",
-    "optional: optional tests that are automatically skipped, include --optional to run them",
-]
-
-[tool.ty.src]
-respect-ignore-files = true
-
-[tool.ty.environment]
-python = "./.venv"
-
 [tool.typos.files]
-# these files may be written in non english words
-extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizers_/*",
-    "benchmarks/sonnet.txt", "tests/lora/data/*", "examples/pooling/token_embed/*", "build/*",
-    "vllm/third_party/*", "vllm/entrypoints/serve/instrumentator/static/*", "tests/entrypoints/openai/speech_to_text/test_transcription_validation.py",
-    "docs/governance/process.md", "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*"]
+# Minimal excludes for typos checker (tests/benchmarks/docs/examples removed from fork)
+extend-exclude = [
+    "build/*",
+    "vllm/third_party/*",
+    "vllm/entrypoints/serve/instrumentator/static/*",
+    ".git/*",
+]
 ignore-hidden = false
 
 [tool.typos.default]
@@ -132,7 +119,6 @@ bbc5b7ede = "bbc5b7ede"
 NOOPs = "NOOPs"
 nin_shortcut = "nin_shortcut"
 cudaDevAttrMaxSharedMemoryPerBlockOptin = "cudaDevAttrMaxSharedMemoryPerBlockOptin"
-
 depthwise_seperable_out_channel = "depthwise_seperable_out_channel"
 pard_token = "pard_token"
 ptd_token_id = "ptd_token_id"
@@ -144,9 +130,9 @@ view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
+
 iy = "iy"
 indx = "indx"
-# intel cpu features
 tme = "tme"
 dout = "dout"
 Pn = "Pn"
@@ -168,5 +154,3 @@ eles = "eles"
 datas = "datas"
 ser = "ser"
 ure = "ure"
-
-[tool.uv]

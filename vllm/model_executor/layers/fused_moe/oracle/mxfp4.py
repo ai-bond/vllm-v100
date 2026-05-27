@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -32,6 +33,12 @@ class Mxfp4MoeBackend(Enum):
     NONE = "NONE"
     TRITON = "TRITON"
     BATCHED_TRITON = "BATCHED_TRITON"
+
+TRITON_BACKENDS = (
+    Mxfp4MoeBackend.TRITON,
+    Mxfp4MoeBackend.BATCHED_TRITON,
+)
+
 
 def _get_priority_backends(
     moe_config: FusedMoEConfig,
@@ -80,10 +87,20 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> Mxfp4MoeBackend:
     )
 
 
+def mxfp4_round_up_hidden_size_and_intermediate_size(
+    backend: Mxfp4MoeBackend, hidden_size: int, intermediate_size: int
+) -> tuple[int, int]:
+    """Round up hidden_size and intermediate_size based on backend requirements."""
+    if backend in TRITON_BACKENDS:
+        hidden_size = round_up(hidden_size, 256)
+        intermediate_size = round_up(intermediate_size, 256)
+    return hidden_size, intermediate_size
+
+
 def select_mxfp4_moe_backend(
     config: FusedMoEConfig,
-    weight_key: QuantKey | None,
-    activation_key: QuantKey | None,
+    weight_key: QuantKey | None = None,
+    activation_key: QuantKey | None = None,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     if config.is_lora_enabled:
         return Mxfp4MoeBackend.TRITON, backend_to_kernel_cls(Mxfp4MoeBackend.TRITON)[0]

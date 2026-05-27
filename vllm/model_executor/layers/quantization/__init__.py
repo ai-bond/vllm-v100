@@ -12,11 +12,27 @@ logger = init_logger(__name__)
 QuantizationMethods = Literal[
     "awq",
     "fp8",
+    "fbgemm_fp8",
+    "fp_quant",
+    "modelopt",
+    "modelopt_fp4",
+    "modelopt_mxfp8",
+    "modelopt_mixed",
     "gguf",
+    "gptq_marlin",
+    "awq_marlin",
     "gptq",
     "compressed-tensors",
     "bitsandbytes",
+    "experts_int8",
     "quark",
+    "moe_wna16",
+    "torchao",
+    "inc",
+    "mxfp4",
+    "mxfp8",
+    "petit_nvfp4",
+    "cpu_awq",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -34,14 +50,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
 
 
 def register_quantization_config(quantization: str):
-    """Register a customized vllm quantization config.
-
-    When a quantization method is not supported by vllm, you can register a customized
-    quantization config to support it.
-
-    Args:
-        quantization (str): The quantization method name.
-    """
+    """Register a customized vllm quantization config."""
     def _wrapper(quant_config_cls):
         if quantization in QUANTIZATION_METHODS:
             logger.warning(
@@ -52,7 +61,6 @@ def register_quantization_config(quantization: str):
             )
         else:
             QUANTIZATION_METHODS.append(quantization)
-            # Automatically assume the custom quantization config is supported
             if sq := current_platform.supported_quantization:
                 sq.append(quantization)
 
@@ -80,12 +88,28 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "awq": AWQConfig,
+        "awq_marlin": AWQConfig,
         "fp8": Fp8Config,
+        "fbgemm_fp8": Fp8Config,
+        "fp_quant": Fp8Config,
+        "modelopt": Fp8Config,
+        "modelopt_fp4": Fp8Config,
+        "modelopt_mxfp8": Fp8Config,
+        "modelopt_mixed": Fp8Config,
         "gguf": GGUFConfig,
+        "gptq_marlin": GPTQConfig,
         "gptq": GPTQConfig,
         "compressed-tensors": CompressedTensorsConfig,
         "bitsandbytes": BitsAndBytesConfig,
+        "experts_int8": CompressedTensorsConfig,
         "quark": QuarkConfig,
+        "moe_wna16": GPTQConfig,
+        "torchao": BitsAndBytesConfig,
+        "inc": CompressedTensorsConfig,
+        "mxfp4": Fp8Config,
+        "mxfp8": Fp8Config,
+        "petit_nvfp4": Fp8Config,
+        "cpu_awq": AWQConfig,
     }
 
     # Update the `method_to_config` with customized quantization methods.

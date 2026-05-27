@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
@@ -31,7 +31,7 @@ logger = init_logger(__name__)
 
 class AWQConfig(QuantizationConfig):
     """Config class for AWQ.
-
+    
     Reference: https://arxiv.org/abs/2306.00978
     """
 
@@ -40,7 +40,7 @@ class AWQConfig(QuantizationConfig):
         weight_bits: int,
         group_size: int,
         zero_point: bool,
-        modules_to_not_convert: list[str] | None = None,
+        modules_to_not_convert: Optional[list[str]] = None,
     ) -> None:
         super().__init__()
         self.weight_bits = weight_bits
@@ -71,15 +71,14 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # The AWQ kernel only supports Turing or newer GPUs.
-        return 75
+        # The AWQ kernel has been adapted to support Volta (SM 7.0) and newer GPUs.
+        return 70
 
     @staticmethod
     def get_config_filenames() -> list[str]:
         return [
             "quant_config.json",  # E.g., casperhansen/vicuna-7b-v1.5-awq
-            # E.g., abhinavkulkarni/mosaicml-mpt-7b-instruct-w4-g128-awq
-            "quantize_config.json",
+            "quantize_config.json",  # E.g., abhinavkulkarni/mosaicml-mpt-7b-instruct-w4-g128-awq
         ]
 
     @classmethod
@@ -94,7 +93,7 @@ class AWQConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
+    ) -> Optional[Union["LinearMethodBase", "QuantizeMethodBase"]]:
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix,
@@ -146,7 +145,7 @@ class AWQConfig(QuantizationConfig):
                 self.modules_to_not_convert
             )
 
-    def maybe_update_config(self, model_name: str, revision: str | None = None):
+    def maybe_update_config(self, model_name: str, revision: Optional[str] = None):
         if self.modules_to_not_convert:
             return
 
@@ -164,7 +163,7 @@ class AWQConfig(QuantizationConfig):
 
 class AWQLinearMethod(LinearMethodBase):
     """Linear method for AWQ.
-
+    
     Args:
         quant_config: The AWQ quantization config.
     """
@@ -256,7 +255,7 @@ class AWQLinearMethod(LinearMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: torch.Tensor | None = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         qweight = layer.qweight
         scales = layer.scales
@@ -272,7 +271,9 @@ class AWQLinearMethod(LinearMethodBase):
             out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
             out = torch.matmul(reshaped_x, out)
         else:
+            # pack_factor is passed as split_k_iters for split-K reduction in the kernel
             out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
+
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)

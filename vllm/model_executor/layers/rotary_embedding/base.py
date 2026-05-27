@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
-
 import torch
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
 
 from .common import ApplyRotaryEmb
@@ -15,7 +13,7 @@ from .common import ApplyRotaryEmb
 class RotaryEmbeddingBase(CustomOp):
     """Original rotary positional embedding."""
 
-    # --8<-- [end:rotary_embedding]
+    # --8 <-- [end:rotary_embedding]
 
     def __init__(
         self,
@@ -34,26 +32,19 @@ class RotaryEmbeddingBase(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+
         # TODO(mgoin): disabled for now due to failures
         # Flashinfer only supports head_size=64, 128, 256, 512.
         # https://github.com/flashinfer-ai/flashinfer/blob/ebfd655efe830048dba5d582aaa61d61d1cf9a87/include/flashinfer/utils.cuh#L174-L202
         # self.use_flashinfer = (self.enabled()
-        #                        and dtype in (torch.float16, torch.bfloat16)
+        #                         and dtype in (torch.float16, torch.bfloat16)
         #                        and current_platform.is_cuda()
         #                        and has_flashinfer()
-        #                        and self.head_size in [64, 128, 256, 512])
+        #                         and self.head_size in [64, 128, 256, 512])
 
         # Check if use_flashinfer is already set
         if not hasattr(self, "use_flashinfer"):
             self.use_flashinfer = False
-
-        self.use_aiter = (
-            self.enabled() and rocm_aiter_ops.is_triton_rotary_embed_enabled()
-        )
-        if self.use_aiter:
-            self.rocm_aiter_triton_rotary_embedding = (
-                rocm_aiter_ops.get_triton_rotary_embedding_op()
-            )
 
         if init_cache:
             cache = self._compute_cos_sin_cache()
@@ -236,17 +227,8 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.use_aiter:
-            cos_sin_cache = self._match_cos_sin_cache_dtype(query)
-            self.rocm_aiter_triton_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                cos_sin_cache,
-                self.is_neox_style,
-            )
-            return query, key
+        # ROCm AITER support removed in vllm-v100 fork.
+        # Fallback to CUDA implementation.
         return self.forward_cuda(positions, query, key)
 
     def forward_xpu(

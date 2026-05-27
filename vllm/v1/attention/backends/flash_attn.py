@@ -177,7 +177,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability >= DeviceCapability(8, 0)
+        return capability >= DeviceCapability(7, 0)
 
     @classmethod
     def supports_combination(

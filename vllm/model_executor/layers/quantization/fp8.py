@@ -10,7 +10,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -258,6 +257,7 @@ def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
 
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
+
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
 
@@ -278,7 +278,6 @@ class Fp8LinearMethod(LinearMethodBase):
         # kernel for fast weight-only FP8 quantization
         self.marlin_input_dtype = None
 
-        self.use_aiter_and_is_supported = rocm_aiter_ops.is_linear_fp8_enabled()
         if self.quant_config.use_deep_gemm is not None:
             self.use_deep_gemm = self.quant_config.use_deep_gemm
         else:
@@ -316,7 +315,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_group_shape=GroupShape(*self.weight_block_size),
                 act_quant_group_shape=GroupShape(1, self.weight_block_size[0]),
                 cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
-                use_aiter_and_is_supported=self.use_aiter_and_is_supported,
                 use_deep_gemm=self.use_deep_gemm,
             )
 
@@ -414,7 +412,7 @@ class Fp8LinearMethod(LinearMethodBase):
             weight_scale = layer.weight_scale
 
             # If using w8a8, torch._scaled_mm needs per tensor, so
-            # requantize the logical shards as a single weight.
+            #  requantize the logical shards as a single weight.
             weight, weight_scale, input_scale = process_fp8_weight_tensor_strategy(
                 weight,
                 weight_scale,
@@ -566,9 +564,9 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
 
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
+
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
-
     Also supports loading quantized FP16/BF16 model checkpoints with dynamic
     activation scaling. The weight scaling factor will be initialized after
     the model weights are loaded.
@@ -921,6 +919,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
 class Fp8OnlineMoEMethod(Fp8MoEMethod):
     """MoE method for online FP8 quantization.
+
     Supports loading quantized FP16/BF16 model checkpoints with dynamic
     activation scaling. The weight scaling factor will be initialized after
     the model weights are loaded.

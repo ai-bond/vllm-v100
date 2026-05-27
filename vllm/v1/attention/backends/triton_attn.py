@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
-
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -37,7 +35,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
@@ -52,7 +49,6 @@ class TritonAttentionMetadata:
     # |---------- context_len ----------|
     # |-------------------- seq_len ---------------------|
     #                                   |-- query_len ---|
-
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
     query_start_loc: torch.Tensor
@@ -256,11 +252,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
 class TritonAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
         torch.bfloat16,
         torch.float32,
     ]
+
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
@@ -436,7 +434,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         if output_block_scale is not None:
             raise NotImplementedError(
-                "fused block_scale output quantization is not yet supported"
+                "fused block_scale output quantization is not yet supported "
                 " for TritonAttentionImpl"
             )
 
@@ -592,8 +590,8 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
             # triton kernel does not support uint8 kv_cache
-            #  (because some explicit casts (e.g. float8_e4m3fnuz)
-            #   are not supported)
+            # (because some explicit casts (e.g. float8_e4m3fnuz)
+            # are not supported)
         triton_reshape_and_cache_flash(
             key,
             value,
@@ -603,43 +601,4 @@ class TritonAttentionImpl(AttentionImpl):
             self.kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
-        )
-
-    def fused_rope_kvcache_supported(self):
-        return rocm_aiter_ops.is_enabled()
-
-    def do_rope_and_kv_cache_update(
-        self,
-        layer: AttentionLayer,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
-        is_neox: bool,
-        kv_cache: torch.Tensor,
-        layer_slot_mapping: torch.Tensor,
-    ):
-        key_cache, value_cache = kv_cache.unbind(1)
-        flash_layout = True
-
-        is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")
-        if is_fp8_kv_cache:
-            key_cache = key_cache.view(self.fp8_dtype)
-            value_cache = value_cache.view(self.fp8_dtype)
-
-        rocm_aiter_ops.triton_rope_and_cache(
-            query,
-            key,
-            value,
-            positions,
-            cos_sin_cache,
-            is_neox,
-            key_cache,
-            value_cache,
-            layer_slot_mapping,
-            layer._k_scale,
-            layer._v_scale,
-            flash_layout,
-            is_fp8_kv_cache,
         )

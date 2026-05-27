@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import functools
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeVar
@@ -7,7 +8,6 @@ from typing import Any, ParamSpec, TypeVar
 from torch import fx as fx
 
 from vllm import envs
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.passes.utility.post_cleanup import PostCleanupPass
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
@@ -15,13 +15,6 @@ from vllm.platforms import current_platform
 from vllm.utils.system_utils import set_env_var
 
 from .vllm_inductor_pass import VllmInductorPass
-
-if rocm_aiter_ops.is_enabled():
-    from .fusion.rocm_aiter_fusion import (
-        RocmAiterRMSNormQuantFusionPass,
-        RocmAiterSiluMulFp8GroupQuantFusionPass,
-        RocmAiterTritonAddRMSNormPadFusionPass,
-    )
 
 if current_platform.is_cuda_alike():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
@@ -37,14 +30,13 @@ if current_platform.is_cuda():
     from .fusion.allreduce_rms_fusion import AllReduceFusionPass
     from .fusion.collective_fusion import AsyncTPPass
     from .fusion.minimax_qk_norm_fusion import MiniMaxQKNormPass
-
-from .inductor_pass import (
-    CustomGraphPass,
-    InductorPass,
-    get_pass_context,
-)
-from .utility.fix_functionalization import FixFunctionalizationPass
-from .utility.noop_elimination import NoOpEliminationPass
+    from .inductor_pass import (
+        CustomGraphPass,
+        InductorPass,
+        get_pass_context,
+    )
+    from .utility.fix_functionalization import FixFunctionalizationPass
+    from .utility.noop_elimination import NoOpEliminationPass
 
 logger = init_logger(__name__)
 
@@ -56,6 +48,7 @@ def with_pattern_match_debug(fn: Callable[P, R]) -> Callable[P, R]:
     """
     Function decorator that turns on inductor pattern match debug
     for the duration of the call.
+
     Used to avoid logging builtin Inductor pattern matching.
     """
 
@@ -82,6 +75,7 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
     2. default passes (NoopEliminationPass, FusionPass)
     3. config["post_grad_custom_post_pass"] (if it exists)
     4. fix_functionalization
+
     This way, all passes operate on a functionalized graph.
     """
 
@@ -130,17 +124,13 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
             if self.pass_config.fuse_norm_quant:
                 self.passes += [RMSNormQuantFusionPass(config)]
-                if rocm_aiter_ops.is_enabled():
-                    self.passes += [
-                        RocmAiterRMSNormQuantFusionPass(config),
-                    ]
+                # REMOVED: ROCm AITER RMSNormQuantFusionPass
+
             if self.pass_config.fuse_act_quant:
                 self.passes += [ActivationQuantFusionPass(config)]
-                if rocm_aiter_ops.is_enabled():
-                    self.passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
+                # REMOVED: ROCm AITER SiluMulFp8GroupQuantFusionPass
 
-            if self.pass_config.fuse_act_padding and rocm_aiter_ops.is_enabled():
-                self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
+            # REMOVED: fuse_act_padding pass for ROCm AITER
 
             if self.pass_config.fuse_rope_kvcache:
                 self.passes += [SplitCoalescingPass(config)]
@@ -154,9 +144,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [SplitCoalescingPass(config)]
                 self.passes += [QKNormRoPEFusionPass(config)]
 
-            # needs a functional graph
-            self.post_cleanup = PostCleanupPass(config)
-            self.fix_functionalization = FixFunctionalizationPass(config)
+        # needs a functional graph
+        self.post_cleanup = PostCleanupPass(config)
+        self.fix_functionalization = FixFunctionalizationPass(config)
 
     def add(self, pass_: InductorPass) -> None:
         assert isinstance(pass_, InductorPass)

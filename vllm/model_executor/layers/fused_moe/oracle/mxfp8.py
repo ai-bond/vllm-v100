@@ -15,14 +15,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 logger = init_logger(__name__)
 
+# На Volta V100 (SM 7.0) MXFP8 аппаратно не поддерживается.
+# Мы используем стандартный TRITON бэкенд как fallback, который попытается
+# выполнить деквантизацию и вычисления через стандартный fused_experts.
 _SUPPORTED_BACKENDS: frozenset[Fp8MoeBackend] = frozenset(
     {
-        Fp8MoeBackend.FLASHINFER_TRTLLM,
+        Fp8MoeBackend.TRITON,
     }
 )
 
 _BACKEND_NAME_MAP: dict[str, Fp8MoeBackend] = {
-    "flashinfer_trtllm": Fp8MoeBackend.FLASHINFER_TRTLLM,
+    "triton": Fp8MoeBackend.TRITON,
 }
 
 
@@ -48,8 +51,11 @@ def _select_kernel_cls(
         if supported:
             return cls
         last_reason = reason
+        
+    # Если Triton отклоняет конфигурацию MXFP8, выдаем понятную ошибку.
     raise ValueError(
-        f"No supported MXFP8 expert class for {backend.value}: {last_reason}"
+        f"MXFP8 MoE is not natively supported on Volta V100 (SM 7.0). "
+        f"Failed to fallback to {backend.value}: {last_reason}"
     )
 
 
@@ -62,7 +68,7 @@ def select_mxfp8_moe_backend(
         A tuple of (fp8_backend, experts_cls).
     """
     if config.is_lora_enabled:
-        raise NotImplementedError("LoRA is not supported for MXFP8 MoE.")
+        raise NotImplementedError("LoRA is not supported for MXFP8 MoE on Volta V100.")
 
     runner_backend = config.moe_backend
     if runner_backend != "auto":
@@ -70,7 +76,7 @@ def select_mxfp8_moe_backend(
         if backend is None:
             raise ValueError(
                 f"moe_backend='{runner_backend}' is not supported for "
-                f"MXFP8 MoE. Expected one of "
+                f"MXFP8 MoE on Volta V100. Expected one of "
                 f"{list(_BACKEND_NAME_MAP.keys())}."
             )
         logger.info_once(
@@ -79,9 +85,12 @@ def select_mxfp8_moe_backend(
         )
         return backend, _select_kernel_cls(backend, config)
 
-    # Auto-select: pick the first supported backend.
+    # Auto-select: pick the first supported backend (TRITON fallback).
     for backend in _SUPPORTED_BACKENDS:
-        logger.info_once("Using '%s' MxFp8 MoE backend.", backend.value)
+        logger.info_once(
+            "Using '%s' MxFp8 MoE backend (fallback for Volta V100).", 
+            backend.value
+        )
         return backend, _select_kernel_cls(backend, config)
 
-    raise ValueError("No MXFP8 MoE backends available.")
+    raise ValueError("No MXFP8 MoE backends available for Volta V100.")

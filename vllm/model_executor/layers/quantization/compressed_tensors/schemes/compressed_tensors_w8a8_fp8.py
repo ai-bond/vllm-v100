@@ -7,7 +7,6 @@ import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_fp8_linear_kernel,
@@ -51,14 +50,17 @@ strategy_to_parameter_type = {
 
 STATIC_QUANT = True
 DYNAMIC_QUANT = False
+
 activation_quant_key_mapping = {
     STATIC_QUANT: kFp8StaticTensorSym,
     DYNAMIC_QUANT: kFp8DynamicTokenSym,
 }
+
 weight_quant_key_mapping = {
     QuantizationStrategy.CHANNEL: kFp8StaticTokenSym,
     QuantizationStrategy.TENSOR: kFp8StaticTensorSym,
 }
+
 logger = init_logger(__name__)
 
 
@@ -72,14 +74,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
         if self.weight_block_size is not None:
             self.cutlass_block_fp8_supported = cutlass_block_fp8_supported()
-            self.use_aiter_and_is_supported = rocm_aiter_ops.is_linear_fp8_enabled()
             assert not self.is_static_input_scheme
             self.act_q_group_shape = GroupShape(1, self.weight_block_size[0])
             self.w8a8_block_fp8_linear = W8A8BlockFp8LinearOp(
                 weight_group_shape=GroupShape(*self.weight_block_size),
                 act_quant_group_shape=self.act_q_group_shape,
                 cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
-                use_aiter_and_is_supported=self.use_aiter_and_is_supported,
             )
         else:
             activation_quant_key = activation_quant_key_mapping[is_static_input_scheme]
@@ -185,6 +185,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         else:
             layer.input_scale = None
+
         if self.strategy == QuantizationStrategy.BLOCK:
             maybe_post_process_fp8_weight_block(layer)
 

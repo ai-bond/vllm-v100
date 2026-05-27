@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
-    AiterInt8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
-    CPUInt8ScaledMMLinearKernel,
-)
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassFP8ScaledMMLinearKernel,
     CutlassInt8ScaledMMLinearKernel,
@@ -21,9 +15,6 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     ChannelWiseTorchFP8ScaledMMLinearKernel,
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
-    ROCmFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
@@ -44,8 +35,6 @@ __all__ = [
     "Int8ScaledMMLinearLayerConfig",
     "ScaledMMLinearKernel",
     "ScaledMMLinearLayerConfig",
-    "AiterInt8ScaledMMLinearKernel",
-    "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",
     "CutlassInt8ScaledMMLinearKernel",
     "FlashInferFP8ScaledMMLinearKernel",
@@ -53,6 +42,5 @@ __all__ = [
     "ChannelWiseTorchFP8ScaledMMLinearKernel",
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",
-    "ROCmFP8ScaledMMLinearKernel",
     "TritonInt8ScaledMMLinearKernel",
 ]

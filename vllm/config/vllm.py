@@ -139,27 +139,14 @@ def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     """Enable if rotary embedding custom op is active and
     use_inductor_graph_partition is enabled.
     """
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    return (
-        rocm_aiter_ops.is_enabled()
-        and cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
-        and (
-            cfg.compilation_config.use_inductor_graph_partition
-            or not cfg.compilation_config.splitting_ops_contain_kv_cache_update()
-        )
-    )
+    # ROCm AITER is not supported on Volta/CUDA
+    return False
 
 
 def enable_norm_pad_fusion(cfg: "VllmConfig") -> bool:
     """Enable if using AITER RMSNorm and hidden size is 2880 i.e. gpt-oss."""
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    return (
-        rocm_aiter_ops.is_rmsnorm_enabled()
-        and cfg.model_config is not None
-        and cfg.model_config.get_hidden_size() == 2880
-    )
+    # ROCm AITER is not supported on Volta/CUDA
+    return False
 
 
 OPTIMIZATION_LEVEL_00 = {

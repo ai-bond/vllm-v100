@@ -29,9 +29,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.allspark import (
 from vllm.model_executor.kernels.linear.mixed_precision.conch import (
     ConchLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.cpu import (
-    CPUWNA16LinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.cutlass import (
     CutlassW4A8LinearKernel,
 )
@@ -47,10 +44,7 @@ from vllm.model_executor.kernels.linear.mixed_precision.machete import (
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
-    XPUW4A8IntLinearKernel,
-    XPUwNa16LinearKernel,
-)
+
 from vllm.model_executor.kernels.linear.scaled_mm import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
@@ -58,12 +52,6 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     Int8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
     ScaledMMLinearLayerConfig,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
-    AiterInt8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
-    CPUInt8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassFP8ScaledMMLinearKernel,
@@ -80,14 +68,8 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
-from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
-    ROCmFP8ScaledMMLinearKernel,
-)
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
     TritonInt8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
-    XPUFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import PlatformEnum, current_platform
@@ -96,12 +78,10 @@ logger = init_logger(__name__)
 
 # in priority/performance order (when available)
 _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]] = {
-    PlatformEnum.CPU: [CPUInt8ScaledMMLinearKernel],
     PlatformEnum.CUDA: [
         CutlassInt8ScaledMMLinearKernel,
         TritonInt8ScaledMMLinearKernel,
     ],
-    PlatformEnum.ROCM: [AiterInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
 }
 
 # in priority/performance order (when available)
@@ -112,19 +92,6 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         CutlassFP8ScaledMMLinearKernel,
         PerTensorTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
-    ],
-    PlatformEnum.ROCM: [
-        ROCmFP8ScaledMMLinearKernel,
-        PerTensorTorchFP8ScaledMMLinearKernel,
-        RowWiseTorchFP8ScaledMMLinearKernel,
-        ChannelWiseTorchFP8ScaledMMLinearKernel,
-    ],
-    PlatformEnum.CPU: [
-        PerTensorTorchFP8ScaledMMLinearKernel,
-        ChannelWiseTorchFP8ScaledMMLinearKernel,
-    ],
-    PlatformEnum.XPU: [
-        XPUFP8ScaledMMLinearKernel,
     ],
 }
 
@@ -137,18 +104,6 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         MarlinLinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
-    ],
-    PlatformEnum.ROCM: [
-        ConchLinearKernel,
-        ExllamaLinearKernel,
-    ],
-    PlatformEnum.XPU: [
-        XPUW4A8IntLinearKernel,
-        XPUwNa16LinearKernel,
-    ],
-    PlatformEnum.CPU: [
-        Dynamic4bitLinearKernel,
-        CPUWNA16LinearKernel,
     ],
 }
 
@@ -377,26 +332,20 @@ __all__ = [
     "FP8ScaledMMLinearLayerConfig",
     "Int8ScaledMMLinearLayerConfig",
     "ScaledMMLinearLayerConfig",
-    "AiterInt8ScaledMMLinearKernel",
-    "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",
     "CutlassInt8ScaledMMLinearKernel",
     "FlashInferFP8ScaledMMLinearKernel",
     "ChannelWiseTorchFP8ScaledMMLinearKernel",
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",
-    "ROCmFP8ScaledMMLinearKernel",
     "TritonInt8ScaledMMLinearKernel",
     "MPLinearKernel",
     "MPLinearLayerConfig",
     "AllSparkLinearKernel",
     "ConchLinearKernel",
-    "CPUWNA16LinearKernel",
     "CutlassW4A8LinearKernel",
     "Dynamic4bitLinearKernel",
     "ExllamaLinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
-    "XPUW4A8IntLinearKernel",
-    "XPUwNa16LinearKernel",
 ]

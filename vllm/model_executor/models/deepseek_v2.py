@@ -23,7 +23,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
-
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -33,7 +32,6 @@ from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm._custom_ops as ops
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -197,7 +195,6 @@ class DeepseekV2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
         # If is_sequence_parallel, the input and output tensors are sharded
         # across the ranks within the tp_group. In this case the weights are
         # replicated and no collective ops are needed.
@@ -221,7 +218,8 @@ class DeepseekV2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -286,11 +284,11 @@ class DeepseekV2MoE(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
-        self.is_rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
-        self.is_fusion_moe_shared_experts_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        )
-        if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
+        # ROCm AITER is not supported in this CUDA-only Volta V100 fork.
+        self.is_rocm_aiter_moe_enabled = False
+        self.is_fusion_moe_shared_experts_enabled = False
+
+        if config.n_shared_experts is None:
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -321,17 +319,12 @@ class DeepseekV2MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func=getattr(config, "scoring_func", "softmax"),
             # we do scaling outside, set factor to 1.0 to avoid double mul
-            # aiter applies routed_scaling_factor internally
-            routed_scaling_factor=1.0
-            if not self.is_rocm_aiter_moe_enabled
-            else self.routed_scaling_factor,
+            routed_scaling_factor=1.0,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            n_shared_experts=config.n_shared_experts
-            if self.is_fusion_moe_shared_experts_enabled
-            else None,
+            n_shared_experts=None,  # AITER shared experts fusion disabled
         )
 
         # NOTE(rob): this is a hack until we finish off the PR for
@@ -375,8 +368,7 @@ class DeepseekV2MoE(nn.Module):
         # Fix FP16 overflow
         # See DeepseekV2DecoderLayer for more details.
         if hidden_states.dtype != torch.float16:
-            if not self.is_rocm_aiter_moe_enabled:
-                final_hidden_states *= self.routed_scaling_factor
+            final_hidden_states *= self.routed_scaling_factor
         elif self.shared_experts is not None:
             assert shared_output is not None
             shared_output *= 1.0 / self.routed_scaling_factor
@@ -449,8 +441,8 @@ class DeepseekV2Attention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         assert topk_indices_buffer is None, (
-            "topk_indices_buffer is not \
-        supported for DeepseekV2Attention"
+            "topk_indices_buffer is not "
+            "supported for DeepseekV2Attention"
         )
 
         if self.q_lora_rank is not None:
@@ -789,32 +781,16 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
 
         # Check if the DeepSeek V3 fused A GEMM kernel can be used.
         # This kernel supports PDL and is optimized for low batch size.
-        self._use_min_latency_gemm = (
-            hasattr(self, "weight")
-            and self.weight.dtype == torch.bfloat16
-            and self.weight.shape[0] == 2112
-            and self.weight.shape[1] == 7168
-            and current_platform.is_cuda()
-            and (
-                current_platform.is_device_capability(90)
-                or current_platform.is_device_capability_family(100)
-            )
-        )
+        # Note: disabled on Volta V100 since it requires SM 9.0+
+        self._use_min_latency_gemm = False
 
     def forward(
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.nn.Parameter | None]:
-        if self._use_min_latency_gemm:
-            output = torch.ops.vllm.min_latency_fused_qkv_a_proj(input_, self.weight)
-            if not self.return_bias:
-                return output
-            output_bias = self.bias if self.skip_bias_add else None
-            return output, output_bias
-        else:
-            # Fallback to the standard forward method when
-            # the fused A GEMM kernel cannot be used.
-            return super().forward(input_)
+        # Fallback to the standard forward method since the fused A GEMM
+        # kernel cannot be used on Volta V100.
+        return super().forward(input_)
 
 
 class DeepseekV2MLAAttention(nn.Module):
@@ -822,8 +798,8 @@ class DeepseekV2MLAAttention(nn.Module):
     Main reference: DeepseekV2 paper, and FlashInfer Implementation
     (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
 
-        For more info see MLACommonImpl in:
-        vllm/v1/attention/backends/mla/utils.py
+    For more info see MLACommonImpl in:
+    vllm/v1/attention/backends/mla/utils.py
     """
 
     def __init__(
@@ -1117,7 +1093,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ):
             # Fix FP16 overflow
             # We scale both hidden_states and residual before
-            # rmsnorm, and rmsnorm result would not affect by scale.
+            # rmsnorm, and rmsnorm result would not affected by scale.
             hidden_states *= 1.0 / self.routed_scaling_factor
             if self.layer_idx == 0:
                 # The residual is shared by all layers, we only scale it on
@@ -1421,9 +1397,9 @@ class DeepseekV2ForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        rocm_aiter_moe_shared_expert_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        )
+        # ROCm AITER fusion_shared_experts is disabled in this CUDA-only fork
+        rocm_aiter_moe_shared_expert_enabled = False
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1450,12 +1426,7 @@ class DeepseekV2ForCausalLM(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if rocm_aiter_moe_shared_expert_enabled
-                else 0
-            ),
+            num_experts=self.config.n_routed_experts,
             num_redundant_experts=self.num_redundant_experts,
         )
 

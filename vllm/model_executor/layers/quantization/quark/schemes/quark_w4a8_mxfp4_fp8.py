@@ -8,7 +8,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -19,24 +18,53 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.platforms import current_platform
-
 from .quark_scheme import QuarkScheme
 
 logger = init_logger(__name__)
-
 
 __all__ = ["QuarkW4A8_MXFP4_FP8"]
 
 OCP_MX_BLOCK_SIZE = 32
 
+_MXFP4_VALUES = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+def _dequant_mxfp4_local(
+    weight_packed: torch.Tensor,
+    scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    device = weight_packed.device
+    lut = _MXFP4_VALUES.to(device)
+
+    low = weight_packed & 0x0F
+    high = (weight_packed >> 4) & 0x0F
+
+    low_vals = lut[low.long()]
+    high_vals = lut[high.long()]
+
+    shape = list(weight_packed.shape[:-1]) + [weight_packed.shape[-1] * 2]
+    weight_vals = torch.empty(shape, dtype=torch.float32, device=device)
+    weight_vals[..., 0::2] = low_vals
+    weight_vals[..., 1::2] = high_vals
+
+    scale_uint8 = scale.view(torch.uint8).to(torch.float32)
+    scale_float = torch.pow(2.0, scale_uint8 - 127.0)
+
+    scale_expanded = scale_float.unsqueeze(-1).expand(*scale_float.shape, 32)
+    scale_expanded = scale_expanded.reshape(*weight_vals.shape[:-1], -1)
+
+    K = weight_vals.shape[-1]
+    scale_expanded = scale_expanded[..., :K]
+
+    weight_dequant = weight_vals * scale_expanded
+    return weight_dequant.to(out_dtype)
+
 
 class QuarkW4A8_MXFP4_FP8(QuarkScheme):
-    """
-    - Weights: MXFP4 with E8M0 scales per block of 32
-    - Activations: FP8 E4M3 (static per-tensor quantization)
-
-    Uses the AITER Triton kernel and falls back to emulation if AITER not available.
-    """
 
     def __init__(
         self,
@@ -46,11 +74,11 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
         self.out_dtype = None
 
         self.weight_dtype = "mxfp4"
-        self.packed_factor: Fraction = Fraction(2, 1)  # 2 FP4 values per byte
+        self.packed_factor: Fraction = Fraction(2, 1)
         self.weight_block_size = OCP_MX_BLOCK_SIZE
 
         self.is_static_input_scheme = not input_quant_spec.get("is_dynamic")
-        self.input_qscheme = input_quant_spec.get("qscheme")  # "per_tensor"
+        self.input_qscheme = input_quant_spec.get("qscheme")
 
         self.fp8_min, self.fp8_max = get_fp8_min_max()
         self.fp8_dtype = current_platform.fp8_dtype()
@@ -62,22 +90,13 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
                 "FP8 scales stored in the checkpoint."
             )
 
-        kernel_supported_gpu = False
-        if current_platform.is_rocm():
-            from vllm.platforms.rocm import on_gfx950
+        # AITER не поддерживается на Volta V100
+        self.use_aiter_kernel = False
 
-            kernel_supported_gpu = on_gfx950()
-
-        self.use_aiter_kernel = (
-            is_aiter_found_and_supported()
-            and self.is_static_input_scheme
-            and kernel_supported_gpu
+        logger.warning_once(
+            "[W4A8 MXFP4+FP8] Aiter Triton kernel not supported on Volta V100. "
+            "Using emulation mode."
         )
-
-        if not self.use_aiter_kernel:
-            logger.warning_once(
-                "[W4A8 MXFP4+FP8] Aiter Triton kernel not found. Using emulation mode."
-            )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -138,12 +157,10 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
                 ),
                 weight_loader=weight_loader,
             )
-            # Initialize to avoid NaN
             input_scale[:] = torch.finfo(torch.float32).min
             layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Ensuring weights & scales are non-trainable
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(
             layer.weight_scale.data, requires_grad=False
@@ -151,7 +168,6 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
 
         if self.is_static_input_scheme:
             input_scale = layer.input_scale.data
-            # For fused modules (QKV), take the max scale
             if input_scale.numel() != 1:
                 input_scale = input_scale.max()
 
@@ -166,34 +182,7 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.use_aiter_kernel:
-            return self._apply_aiter_kernel(layer, x, bias)
-        else:
-            return self._apply_emulation(layer, x, bias)
-
-    def _apply_aiter_kernel(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        M = x.shape[0]
-        out_dtype = x.dtype if self.out_dtype is None else self.out_dtype
-
-        input_scale = layer.input_scale
-        x_fp8 = (x / input_scale).clamp(self.fp8_min, self.fp8_max).to(self.fp8_dtype)
-
-        # Broadcast per-tensor scale to per-row (M, 1) for Aiter kernel
-        x_scales = input_scale.expand(M, 1).to(dtype=torch.float32, device=x.device)
-
-        y = rocm_aiter_ops.gemm_a8wfp4(
-            x_fp8, layer.weight, x_scales, layer.weight_scale, out_dtype
-        )
-
-        if bias is not None:
-            y = y + bias
-
-        return y
+        return self._apply_emulation(layer, x, bias)
 
     def _apply_emulation(
         self,
@@ -201,11 +190,7 @@ class QuarkW4A8_MXFP4_FP8(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-            dequant_mxfp4,
-        )
-
-        weight_dq = dequant_mxfp4(
+        weight_dq = _dequant_mxfp4_local(
             layer.weight,
             layer.weight_scale,
             x.dtype,

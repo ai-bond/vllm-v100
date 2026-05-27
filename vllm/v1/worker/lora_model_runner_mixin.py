@@ -3,9 +3,7 @@
 """
 Define LoRA functionality mixin for model runners.
 """
-
 from contextlib import contextmanager
-from typing import TypeAlias
 
 import numpy as np
 import torch
@@ -19,9 +17,6 @@ from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor.models import supports_lora
 from vllm.v1.worker.gpu_input_batch import InputBatch as GPUInputBatch
-from vllm.v1.worker.tpu_input_batch import InputBatch as TPUInputBatch
-
-InputBatch: TypeAlias = TPUInputBatch | GPUInputBatch
 
 logger = init_logger(__name__)
 
@@ -68,11 +63,13 @@ class LoRAModelRunnerMixin:
 
     def _ensure_lora_enabled(self) -> None:
         if not hasattr(self, "lora_manager"):
-            raise RuntimeError("LoRA is not enabled. Use --enable-lora to enable LoRA.")
+            raise RuntimeError(
+                "LoRA is not enabled. Use --enable-lora to enable LoRA."
+            )
 
     def set_active_loras(
         self,
-        input_batch: InputBatch,
+        input_batch: GPUInputBatch,
         num_scheduled_tokens: np.ndarray,
         num_sampled_tokens: np.ndarray | None = None,
         mapping_type: LoRAMappingType = LoRAMappingType.LANGUAGE,

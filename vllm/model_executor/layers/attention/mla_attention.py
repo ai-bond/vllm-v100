@@ -202,7 +202,6 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -431,15 +430,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
         self.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
-        self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
-
-        # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
-        self.is_aiter_triton_fp4_bmm_enabled = (
-            rocm_aiter_ops.is_fp4bmm_enabled()
-            and hasattr(self.kv_b_proj, "weight")
-            and self.kv_b_proj.weight.dtype == torch.bfloat16
-        )
-
         # Attributes for forward_impl method
         self._vllm_config = get_current_vllm_config()
         self._chunked_prefill_workspace_size: int | None = None
@@ -629,42 +619,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
-            if self.is_aiter_triton_fp4_bmm_enabled:
-                from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+            # Pads the head_dim if necessary (for the underlying kernel)
+            N, B, P = mqa_q_nope.shape
+            _, _, L = self.W_UK_T.shape
 
-                mqa_ql_nope = batched_gemm_a16wfp4(
-                    mqa_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
-                    transpose_bm=True,
-                    prequant=True,
-                    y_scale=self._q_scale if fp8_attention else None,
-                )
-            elif self.is_aiter_triton_fp8_bmm_enabled:
-                # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
-                mqa_ql_nope = rocm_aiter_ops.triton_fp8_bmm(
-                    mqa_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
-                    group_size=128,
-                    transpose_bm=True,
-                )
+            if self.q_pad_num_heads is not None:
+                mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
+                mqa_ql_nope.resize_((N, B, L))
             else:
-                # Pads the head_dim if necessary (for the underlying kernel)
-                N, B, P = mqa_q_nope.shape
-                _, _, L = self.W_UK_T.shape
+                mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
-                if self.q_pad_num_heads is not None:
-                    mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
-                    mqa_ql_nope.resize_((N, B, L))
-                else:
-                    mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
+            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
 
-                # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
-
-                # Convert from (N, B, L) to (B, N, L)
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+            # Convert from (N, B, L) to (B, N, L)
+            mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
@@ -735,66 +704,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
 
-        # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
-        if self.is_aiter_triton_fp4_bmm_enabled:
-            from vllm.model_executor.layers.quantization.quark.utils import (
-                quark_quantize_weight_to_mxfp4,
-            )
-
-            self.W_K, self.W_K_scale = quark_quantize_weight_to_mxfp4(W_UK)
-            # Convert from (L, N, P) to (N, L, P)
-            self.W_K = self.W_K.transpose(0, 1)
-            self.W_K_scale = self.W_K_scale.transpose(0, 1)
-
-            self.W_V, self.W_V_scale = quark_quantize_weight_to_mxfp4(
-                W_UV.permute(1, 2, 0)
-            )
-        elif self.is_aiter_triton_fp8_bmm_enabled:
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
-            W_V = W_UV.permute(1, 2, 0)  # 16 128 512
-            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
-                W_K, dtype=current_platform.fp8_dtype()
-            )
-            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
-                W_V, dtype=current_platform.fp8_dtype()
-            )
-
-            # The kernel operates on non-padded inputs. Hence, pre-compiling
-            # triton kernel to avoid runtime compilation for unseen batch sizes
-            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
-            # On DS-R1, this step adds roughly 50s to the model loading time.
-            max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            pre_compilation_list = list(range(1, max_batch_size + 1))
-            if is_global_first_rank():
-                pre_compilation_list = tqdm(
-                    pre_compilation_list,
-                    desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
-                    total=max_batch_size,
-                )
-
-            for m in pre_compilation_list:
-                x = torch.empty(
-                    (self.W_K.shape[0], m, self.W_K.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=self.W_K.device,
-                )
-                rocm_aiter_ops.triton_fp8_bmm(
-                    x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
-                )
-
-                x = torch.empty(
-                    (self.W_V.shape[0], m, self.W_V.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=self.W_V.device,
-                )
-                rocm_aiter_ops.triton_fp8_bmm(
-                    x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
-                )
-        else:
-            # Convert from (L, N, V) to (N, L, V)
-            self.W_UV = W_UV.transpose(0, 1)
-            # Convert from (L, N, P) to (N, P, L)
-            self.W_UK_T = W_UK.permute(1, 2, 0)
+        # Convert from (L, N, V) to (N, L, V)
+        self.W_UV = W_UV.transpose(0, 1)
+        # Convert from (L, N, P) to (N, P, L)
+        self.W_UK_T = W_UK.permute(1, 2, 0)
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -845,40 +758,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
-        # Convert from (B, N, L) to (N, B, L)
-        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
-        out = out.view(-1, self.num_heads, self.v_head_dim)
-        if self.is_aiter_triton_fp4_bmm_enabled:
-            out = rocm_aiter_ops.batched_gemm_a16wfp4(
-                x,
-                self.W_V,
-                self.W_V_scale,
-                out,
-                transpose_bm=True,
-                prequant=True,
-                y_scale=None,
-            )
-            x = out.view(-1, self.num_heads * self.v_head_dim)
-        elif self.is_aiter_triton_fp8_bmm_enabled:
-            # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            x = rocm_aiter_ops.triton_fp8_bmm(
-                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
-            )
-        else:
-            # Convert from (B, N * V) to (N, B, V)
-            out = out.transpose(0, 1)
+        # Convert from (B, N * V) to (N, B, V)
+        out = out.transpose(0, 1)
 
-            # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-            torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
+        # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
+        torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
 
-            # Convert from (N, B, V) to (B, N * V)
-            out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
+        # Convert from (N, B, V) to (B, N * V)
+        out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
 
-            # Adjust output buffer shape back to the original (B, N * V)
-            N, B, V = out.shape
-            out.resize_((B, N * V))
-            out.copy_(out_new)  # Copy result
-
+        # Adjust output buffer shape back to the original (B, N * V)
+        N, B, V = out.shape
+        out.resize_((B, N * V))
+        out.copy_(out_new)  # Copy result
 
 @maybe_transfer_kv_layer
 def unified_mla_attention(
@@ -1046,35 +938,7 @@ try:
     is_vllm_fa = True
 except ImportError:
     is_vllm_fa = False
-    flash_attn_varlen_func = None  # type: ignore[assignment]
-    # On ROCm, vllm_flash_attn is not available, try upstream flash_attn instead.
-    # On CUDA, vllm_flash_attn should always be available (built with vLLM),
-    # so we don't attempt the fallback there.
-    if current_platform.is_rocm():
-        try:
-            from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
-        except ImportError:
-            logger.debug(
-                "flash_attn not available on ROCm; "
-                "MLA models using TRITON_MLA will require flash_attn. "
-                "AITER_MLA backends use aiter kernels instead."
-            )
-    elif current_platform.is_xpu():
-        from vllm._xpu_ops import xpu_ops as ops
-
-        flash_attn_varlen_func = ops.flash_attn_varlen_func  # type: ignore[no-redef]
-
-
-def dynamic_per_batched_tensor_quant(
-    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
-):
-    DTYPE_MAX = torch.finfo(dtype).max
-    min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
-    scale = DTYPE_MAX / amax
-    x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
-    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
-
+    flash_attn_varlen_func = None
 
 logger = init_logger(__name__)
 

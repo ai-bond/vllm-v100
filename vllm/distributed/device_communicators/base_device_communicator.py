@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import threading
 from weakref import WeakValueDictionary
 
@@ -11,12 +12,10 @@ from torch.distributed import ProcessGroup
 class Cache:
     def __init__(self):
         self._cache: WeakValueDictionary = WeakValueDictionary()
-        self._lock = threading.RLock()  # Reentrant lock for thread safety
+        self._lock = threading.RLock()
 
     def get_or_create(self, kwargs, func):
-        # Create a hashable key from the kwargs
         key = tuple(sorted((k, v) for k, v in kwargs.items()))
-
         with self._lock:
             instance = self._cache.get(key)
             if instance is None:
@@ -33,26 +32,20 @@ class All2AllManagerBase:
         self.cpu_group = cpu_group
         self.tcp_store_group = tcp_store_group
 
-        # compute some common properties
         from vllm.distributed.parallel_state import (
             get_dp_group,
             get_tp_group,
             in_the_same_node_as,
         )
 
-        # all2all lives in ep group, which is merged from dp and tp group
         self.dp_group = get_dp_group()
         self.tp_group = get_tp_group()
 
-        # no self.ep_group since self.ep_group is still in construction
-        # when we create this object
         self.dp_rank = self.dp_group.rank_in_group
         self.dp_world_size = self.dp_group.world_size
         self.rank = cpu_group.rank()
         self.world_size = cpu_group.size()
 
-        # all2all communication often has separate implementations for
-        # intra-node and inter-node communication
         if tcp_store_group is None:
             self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))
         else:
@@ -61,12 +54,6 @@ class All2AllManagerBase:
             )
 
     def get_handle(self, kwargs):
-        # get a handle for the all2all communication,
-        # based on the kwargs.
-        # different layers can have different configs,
-        # e.g. one layer has hidden size 1024, another has 2048.
-        # usually the underlying implementation caches the handle
-        # and reuse it for the same config.
         raise NotImplementedError
 
     def dispatch_router_logits(
@@ -75,13 +62,7 @@ class All2AllManagerBase:
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
         extra_tensors: list[torch.Tensor] | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
-        # Subclasses should either:
-        # - implement handling for extra_tensors, or
-        # - raise a clear error if extra_tensors is not supported.
         raise NotImplementedError
 
     def dispatch(
@@ -91,20 +72,14 @@ class All2AllManagerBase:
         topk_ids: torch.Tensor,
         is_sequence_parallel: bool = False,
         extra_tensors: list[torch.Tensor] | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
-        # Subclasses should either:
-        # - implement handling for extra_tensors, or
-        # - raise a clear error if extra_tensors is not supported.
         raise NotImplementedError
 
     def set_num_sms(self, num_sms: int):
         pass
 
     def max_sms_used(self) -> int | None:
-        return None  # None means it could use the whole GPU
+        return None
 
     def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False):
         raise NotImplementedError
@@ -116,9 +91,6 @@ class All2AllManagerBase:
 class DeviceCommunicatorBase:
     """
     Base class for device-specific communicator.
-    It can use the `cpu_group` to initialize the communicator.
-    If the device has PyTorch integration (PyTorch can recognize its
-    communication backend), the `device_group` will also be given.
     """
 
     def __init__(
@@ -135,13 +107,11 @@ class DeviceCommunicatorBase:
         self.device_group = device_group
         self.unique_name = unique_name
 
-        # Check if this is a stateless process group
         from torch.distributed.distributed_c10d import _world
 
         is_stateless = _world.pg_map.get(cpu_group, None) is None
 
         if is_stateless:
-            # For stateless groups, we can't use torch.distributed methods
             self.rank = cpu_group.rank()
             self.world_size = cpu_group.size()
             assert global_ranks is not None
@@ -164,9 +134,6 @@ class DeviceCommunicatorBase:
 
         config = get_current_vllm_config_or_none()
         if config is not None:
-            # as long as we use data parallel (coupled data parallel
-            # where all data parallel ranks execute forward together),
-            # we initialize the all2all manager used in expert parallel.
             use_ep = config.parallel_config.data_parallel_size > 1
             all2all_backend = config.parallel_config.all2all_backend
 
@@ -181,20 +148,13 @@ class DeviceCommunicatorBase:
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
-            # Convert negative dim to positive.
             dim += input_.dim()
         input_size = input_.size()
-        # NOTE: we have to use concat-style all-gather here,
-        # stack-style all-gather has compatibility issues with
-        # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
-        # Allocate output tensor.
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
-        # All-gather.
         dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
-        # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
@@ -214,21 +174,12 @@ class DeviceCommunicatorBase:
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
-
         if dim < 0:
-            # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
         input_tensor = input_.movedim(0, dim).contiguous()
-
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
@@ -237,12 +188,10 @@ class DeviceCommunicatorBase:
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
 
-        # Perform reduce-scatter operation
         torch.distributed.reduce_scatter_tensor(
             output_tensor, input_tensor, group=self.device_group
         )
 
-        # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
@@ -253,37 +202,23 @@ class DeviceCommunicatorBase:
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
     ) -> torch.Tensor | None:
-        """
-        NOTE: We assume that the input tensor is on the same device across
-        all the ranks.
-        NOTE: `dst` is the local rank of the destination rank.
-        """
         world_size = self.world_size
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
         if dim < 0:
-            # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Allocate output tensor.
         if self.rank_in_group == dst:
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]
         else:
             gather_list = None
-        # Gather.
+
         torch.distributed.gather(
             input_, gather_list, dst=self.ranks[dst], group=self.device_group
         )
         if self.rank_in_group == dst:
-            output_tensor = torch.cat(gather_list, dim=dim)
-        else:
-            output_tensor = None
-        return output_tensor
+            return torch.cat(gather_list, dim=dim)
+        return None
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
-        """Sends a tensor to the destination rank in a blocking way"""
-        """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
         torch.distributed.send(tensor, self.ranks[dst], self.device_group)
@@ -291,17 +226,13 @@ class DeviceCommunicatorBase:
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
     ) -> torch.Tensor:
-        """Receives a tensor from the source rank."""
-        """NOTE: `src` is the local rank of the source rank."""
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
-
         tensor = torch.empty(size, dtype=dtype, device=self.device)
         torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
-        """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
             return tensor
         torch.distributed.broadcast(tensor, self.ranks[src], self.device_group)
@@ -311,17 +242,12 @@ class DeviceCommunicatorBase:
         pass
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module) -> None:
-        """
-        Prepare the communication buffer for the model.
-        """
         if not self.is_ep_communicator:
             return
 
         moe_modules = [
             module
             for module in model.modules()
-            # TODO(bnell): Should use isinstance but can't.  Maybe search for
-            # presence of quant_method.maybe_init_modular_kernel?
             if (
                 module.__class__.__name__ == "FusedMoE"
                 or module.__class__.__name__ == "SharedFusedMoE"
@@ -336,14 +262,7 @@ class DeviceCommunicatorBase:
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
         extra_tensors: list[torch.Tensor] | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
-        """
-        Dispatch the hidden states and router logits to the appropriate device.
-        This is a no-op in the base class.
-        """
         if extra_tensors is not None:
             return hidden_states, router_logits, extra_tensors
         return hidden_states, router_logits
@@ -355,14 +274,7 @@ class DeviceCommunicatorBase:
         topk_ids: torch.Tensor,
         is_sequence_parallel: bool = False,
         extra_tensors: list[torch.Tensor] | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
-        """
-        Dispatch the hidden states and topk weights/ids to the appropriate device.
-        This is a no-op in the base class.
-        """
         if extra_tensors is not None:
             return hidden_states, topk_weights, topk_ids, extra_tensors
         return hidden_states, topk_weights, topk_ids
@@ -370,10 +282,6 @@ class DeviceCommunicatorBase:
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        """
-        Combine the hidden states and router logits from the appropriate device.
-        This is a no-op in the base class.
-        """
         return hidden_states
 
     def batch_isend_irecv(self, p2p_ops: list):

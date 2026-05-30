@@ -5,13 +5,6 @@ import torch
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
-from vllm.distributed.device_communicators.all_reduce_utils import (
-    should_nccl_symm_mem_allreduce,
-)
-from vllm.distributed.device_communicators.pynccl import register_nccl_symmetric_ops
-from vllm.distributed.device_communicators.pynccl_allocator import (
-    is_symmetric_memory_enabled,
-)
 from vllm.logger import init_logger
 
 from ..utils import StatelessProcessGroup
@@ -41,24 +34,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
         if "tp" not in unique_name:
-            # custom allreduce or torch symm mem can be used only by tp
+            # custom allreduce can be used only by tp
             use_custom_allreduce = False
-            use_torch_symm_mem = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
 
         self.use_custom_allreduce = use_custom_allreduce
-        self.use_torch_symm_mem = use_torch_symm_mem
 
         # Lazy imports for CUDA-specific communicators
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
@@ -66,46 +55,39 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group=self.cpu_group if tcp_store_group is None else tcp_store_group,
                 device=self.device,
             )
-            if is_symmetric_memory_enabled():
-                register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
-        self.symm_mem_comm: SymmMemCommunicator | None = None
-
-        if use_torch_symm_mem:
-            self.symm_mem_comm = SymmMemCommunicator(
-                group=self.cpu_group,
-                device=self.device,
-            )
 
         if use_custom_allreduce and self.world_size > 1:
-            # Initialize a custom fast all-reduce implementation for CUDA.
+            # Initialize a custom fast all-reduce implementation for CUDA (NVLink/IPC).
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
-                symm_mem_enabled=(
-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                ),
+                symm_mem_enabled=False,  # Symmetric memory disabled on Volta
             )
 
         if self.use_all2all:
             if self.all2all_backend == "naive":
                 from .all2all import NaiveAll2AllManager
+
                 self.all2all_manager = NaiveAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
             elif self.all2all_backend == "allgather_reducescatter":
                 from .all2all import AgRsAll2AllManager
+
                 self.all2all_manager = AgRsAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
             elif self.all2all_backend == "deepep_high_throughput":
                 from .all2all import DeepEPHTAll2AllManager
+
                 self.all2all_manager = DeepEPHTAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
             elif self.all2all_backend == "deepep_low_latency":
                 from .all2all import DeepEPLLAll2AllManager
+
                 self.all2all_manager = DeepEPLLAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
@@ -121,22 +103,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        # 1. Symmetric Memory NCCL path
-        if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
-            self.pynccl_comm.world_size, input_
-        ):
-            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
-            if out is not None:
-                return out
-
-        # 2. Torch Symmetric Memory path
-        symm_mem_comm = self.symm_mem_comm
-        if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
-            out = symm_mem_comm.all_reduce(input_)
-            assert out is not None
-            return out
-
-        # 3. Custom All-Reduce path (fast CUDA IPC/NVLink)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -147,7 +113,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert out is not None
             return out
 
-        # 4. Standard PyNCCL path (No fallback to torch.distributed)
         assert self.pynccl_comm is not None and not self.pynccl_comm.disabled, (
             "PyNCCL communicator is required for all_reduce on CUDA but is disabled or missing."
         )
@@ -225,7 +190,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        
+
         assert self.pynccl_comm is not None and not self.pynccl_comm.disabled, (
             "PyNCCL is required for P2P recv"
         )

@@ -1,14 +1,6 @@
 // ======================================================================================
-// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007 SPDX-License: BSD-3-Clause
-// ======================================================================================
-// * AWQ 4-bit GEMM kernel for Volta (SM 7.0) with online dequantization.
-// * Computes C = A (fp16) @ dequant(B int4) using Volta WMMA m16n16k16.
-// *
-// * 1. TILE SHAPE:     M=16 per block, N={64,128} (2 warps x N/2 each), K=32.
-// * 2. WMMA OP:        wmma.mma.sync.aligned.m16n16k16.row.row.f32.f32
-// * 3. LOADS:          ld.shared.v4.u32 (A, row-major) / ld.shared.v2.u32 (B, row-major).
-// * 4. DEQUANTIZATION: Inline via dequantize_s4_to_fp16x2() + scale/zero FMA + prmt.b32 nibble reorder.
-// * 5. SPLIT-K:        Supported via blockIdx.z reduction in outer Python wrapper (fp32 buffer).
+// * Copyright (c) 2026, D.Skryabin / tg @ai_bond007
+// * SPDX-License: BSD-3-Clause
 // ======================================================================================
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -19,7 +11,7 @@ namespace vllm {
 namespace awq {
 
 // ======================================================================================
-// GEMM KERNEL: m16n16k16 (X in {64, 128}) with inline 4-bit dequantization
+// GEMM KERNEL: m16n16k16 (N in {64, 128}) with inline 4-bit dequantization
 // ======================================================================================
 // Grid mapping:
 //   blockIdx.x  =  M_tiles * N_tiles * split_k_iters  (flattened 3D index)
@@ -29,8 +21,8 @@ namespace awq {
 //   threadIdx.x =  [0..31]   lane within warp
 //   threadIdx.y =  [0..1]    warp id (each warp handles N/2 output columns)
 // ======================================================================================
-template <int N>
-__global__ void __launch_bounds__(64)
+template <int N, bool SPLIT_K>
+__global__ void __launch_bounds__(64, 8)
 gemm_forward_4bit_cuda_m16n16k16(
     const int    G,                // Group size for quantization scales
     const int    split_k_iters,    // Number of K splits (outer reduction dim)
@@ -41,7 +33,7 @@ gemm_forward_4bit_cuda_m16n16k16(
     const int    M,                // Number of input rows
     const int    IC,               // Input channels  (K dim)
     const int    OC,               // Output channels (N dim)
-    float* __restrict__ C          // [split_k, M, OC] fp32 output (for precise Split-K reduction)
+    void*  __restrict__ C_void     // half* if !SPLIT_K, float* if SPLIT_K
 ) {
     static_assert(N == 64 || N == 128, "Only cta_N = 64 or 128 is supported");
 
@@ -87,7 +79,9 @@ gemm_forward_4bit_cuda_m16n16k16(
     uint32_t B_shared_warp[N / 4];
     float    C_warp[N / 4];
 
+    #pragma unroll  // OPT#5: explicit unroll for ILP
     for (int j_init = 0; j_init < N / 32; ++j_init) {
+        #pragma unroll
         for (int i = 0; i < 8; ++i) {
             C_warp[j_init * 8 + i] = 0.0f;
         }
@@ -121,10 +115,6 @@ gemm_forward_4bit_cuda_m16n16k16(
     int*  zeros_ptr  = zeros  + tile_n * (N / 8) + (tid % (N / 8));
     half* scales_ptr = scales + tile_n * N        + (tid % (N / 8)) * 8;
 
-    float* C_ptr_base = C
-        + static_cast<long long>(blockIdx_z) * M * OC
-        + tile_n * N;
-
     // ==========================================================================
     // Init: K-loop bounds for split-K reduction
     // ==========================================================================
@@ -132,6 +122,7 @@ gemm_forward_4bit_cuda_m16n16k16(
     if ((k_bound - 1) * split_k_iters * 32 + blockIdx_z * 32 >= IC) {
         k_bound -= 1;
     }
+    k_bound = max(1, k_bound);
 
     // ==========================================================================
     // MAIN LOOP: iterate over K tiles (each tile = 32 elements along IC)
@@ -152,21 +143,30 @@ gemm_forward_4bit_cuda_m16n16k16(
         }
 
         // ======================================================================
-        // Load: B scale and zero-point for current K group qzeros interleaved inside each int32
-        // dequantize_s4_to_fp16x2: .x={z0,z4}, .y={z1,z5}, .z={z2,z6}, .w={z3,z7}
-        // We must permute:         .x={z0,z1}, .y={z2,z3}, .z={z4,z5}, .w={z6,z7}
+        // Load: zeros (int4 packed) via ld.global.nc (bypasses L1 cache)
+        // Then: single-pass dequantize to interleaved fp16x2 (OPT#1 + OPT#4)
         // ======================================================================
-        const uint32_t zeros_raw  = *(uint32_t*)(zeros_ptr  + (k_tile * 32 / G) * (OC / 8));
-        uint4 zero_fp16  = dequantize_s4_to_fp16x2(zeros_raw);
+        uint32_t zeros_raw;
+        {
+            uint64_t zeros_addr = reinterpret_cast<uint64_t>(
+                zeros_ptr + (k_tile * 32 / G) * (OC / 8));
+            asm volatile("ld.global.nc.u32 %0, [%1];\n"
+                : "=r"(zeros_raw) : "l"(zeros_addr) : "memory");
+        }
+        uint4 zero_fp16 = dequantize_s4_to_fp16x2_interleaved(zeros_raw);
 
-        uint4 zero_fp16_seq;
-        asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(zero_fp16_seq.x) : "r"(zero_fp16.x), "r"(zero_fp16.z));
-        asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(zero_fp16_seq.y) : "r"(zero_fp16.x), "r"(zero_fp16.z));
-        asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(zero_fp16_seq.z) : "r"(zero_fp16.y), "r"(zero_fp16.w));
-        asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(zero_fp16_seq.w) : "r"(zero_fp16.y), "r"(zero_fp16.w));
-        zero_fp16 = zero_fp16_seq;
-
-        const uint4    scale_fp16 = *(uint4*)(scales_ptr + (k_tile * 32 / G) * OC);
+        // ======================================================================
+        // Load: scales (fp16) via ld.global.nc.v4.b32 (OPT#4)
+        // ======================================================================
+        uint4 scale_fp16;
+        {
+            uint64_t scales_addr = reinterpret_cast<uint64_t>(
+                scales_ptr + (k_tile * 32 / G) * OC);
+            asm volatile("ld.global.nc.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+                : "=r"(scale_fp16.x), "=r"(scale_fp16.y),
+                  "=r"(scale_fp16.z), "=r"(scale_fp16.w)
+                : "l"(scales_addr) : "memory");
+        }
 
         int* B_ptr_local = B_ptr + k_tile * 32 * (OC / 8);
 
@@ -174,20 +174,19 @@ gemm_forward_4bit_cuda_m16n16k16(
         // Load: B tile from global -> dequantize -> shared memory
         //   Each thread loads 1 int32 (8 int4s), converts to 8 fp16, applies
         //   (w - zero) * scale, writes back as uint4 (128-bit).
-        //   qweight uses the same interleaved nibble packing as qzeros, so we
-        //   permute B_deq with the same prmt.b32 pattern before subtracting zero.
+        //   Interleaved layout preserved throughout — no prmt.b32 needed.
         // ======================================================================
+        #pragma unroll  // OPT#5
         for (int tile_b = 0; tile_b < N / 16; ++tile_b) {
-            const uint32_t B_packed = *(uint32_t*)(B_ptr_local + tile_b * ROW_STRIDE_B * (OC / 8));
-            uint4 B_deq = dequantize_s4_to_fp16x2(B_packed);
+            uint32_t B_packed;
+            {
+                uint64_t b_addr = reinterpret_cast<uint64_t>(
+                    B_ptr_local + tile_b * ROW_STRIDE_B * (OC / 8));
+                asm volatile("ld.global.nc.u32 %0, [%1];\n"
+                    : "=r"(B_packed) : "l"(b_addr) : "memory");
+            }
 
-            // Reorder interleaved AWQ qweight nibbles to sequential layout
-            uint4 B_deq_seq;
-            asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(B_deq_seq.x) : "r"(B_deq.x), "r"(B_deq.z));
-            asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(B_deq_seq.y) : "r"(B_deq.x), "r"(B_deq.z));
-            asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(B_deq_seq.z) : "r"(B_deq.y), "r"(B_deq.w));
-            asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(B_deq_seq.w) : "r"(B_deq.y), "r"(B_deq.w));
-            B_deq = B_deq_seq;
+            uint4 B_deq = dequantize_s4_to_fp16x2_interleaved(B_packed);
 
             // (w - zero) * scale  -- applied per fp16x2 pair
             asm volatile("sub.f16x2    %0, %1, %2;\n" : "=r"(B_deq.x) : "r"(B_deq.x), "r"(zero_fp16.x));
@@ -207,6 +206,7 @@ gemm_forward_4bit_cuda_m16n16k16(
         // ======================================================================
         // Compute: split K=32 tile into two K=16 sub-tiles and run WMMA mma
         // ======================================================================
+        #pragma unroll  // OPT#5
         for (int k_sub = 0; k_sub < 2; ++k_sub) {
 
             // ==================================================================
@@ -242,6 +242,7 @@ gemm_forward_4bit_cuda_m16n16k16(
             //                c_base = ((lid>>3)&1)*8 + ((lid>>4)&1)*4
             // Access:        4x ld.shared.v2.u32 (strided rows)
             // ==================================================================
+            #pragma unroll  // OPT#5
             for (int n_tile = 0; n_tile < N / 32; ++n_tile) {
                 const unsigned smem_addr = __cvta_generic_to_shared(
                     &B_shared[k_sub * (N * 16 + 128) + warp_id * (N / 2) + n_tile * 16]);
@@ -280,6 +281,7 @@ gemm_forward_4bit_cuda_m16n16k16(
             // Compute: WMMA m16n16k16 row.row f32 accumulation
             //   C_warp[j_tile * 8 + 0..7] += A_shared_warp @ B_shared_warp[j_tile]
             // ==================================================================
+            #pragma unroll  // OPT#5
             for (int j_tile = 0; j_tile < N / 32; ++j_tile) {
                 asm volatile(
                     "wmma.mma.sync.aligned.m16n16k16.row.row.f32.f32 "
@@ -319,34 +321,86 @@ gemm_forward_4bit_cuda_m16n16k16(
     const int r0 = ((lane_id >> 2) & 1) * 8 + ((lane_id >> 4) & 1) * 4 + (lane_id & 1);
     const int c0 = ((lane_id >> 3) & 1) * 8 + ((lane_id >> 1) & 1) * 2;
 
-    for (int n_out = 0; n_out < (N / 32); ++n_out) {
-        for (int frag_idx = 0; frag_idx < 8; ++frag_idx) {
-            int r_off, c_off;
-            switch (frag_idx) {
-                case 0: r_off = r0;     c_off = c0;     break;
-                case 1: r_off = r0;     c_off = c0 + 1; break;
-                case 2: r_off = r0 + 2; c_off = c0;     break;
-                case 3: r_off = r0 + 2; c_off = c0 + 1; break;
-                case 4: r_off = r0;     c_off = c0 + 4; break;
-                case 5: r_off = r0;     c_off = c0 + 5; break;
-                case 6: r_off = r0 + 2; c_off = c0 + 4; break;
-                case 7: r_off = r0 + 2; c_off = c0 + 5; break;
-                default: r_off = 0;     c_off = 0;      break;
+    if constexpr (!SPLIT_K) {
+        // ======================================================================
+        // FAST PATH: Direct fp16 output (no reduction needed)
+        // Pack 2 floats into half2, then store as single uint32_t (4 bytes).
+        // ======================================================================
+        half* C = reinterpret_cast<half*>(C_void);
+        half* C_ptr_base = C + tile_n * N;
+
+        #pragma unroll
+        for (int n_out = 0; n_out < (N / 32); ++n_out) {
+            int global_row_0 = tile_m * 16 + r0;
+            int global_row_2 = global_row_0 + 2;
+            int global_col_0 = n_out * 16 + c0 + warp_id * (N / 2);
+            int global_col_4 = global_col_0 + 4;
+
+            if (global_row_0 < M) {
+                half2 h01 = __float22half2_rn(make_float2(C_warp[n_out * 8 + 0], C_warp[n_out * 8 + 1]));
+                half2 h45 = __float22half2_rn(make_float2(C_warp[n_out * 8 + 4], C_warp[n_out * 8 + 5]));
+                *reinterpret_cast<uint32_t*>(&C_ptr_base[global_row_0 * OC + global_col_0]) = *reinterpret_cast<uint32_t*>(&h01);
+                *reinterpret_cast<uint32_t*>(&C_ptr_base[global_row_0 * OC + global_col_4]) = *reinterpret_cast<uint32_t*>(&h45);
             }
+            if (global_row_2 < M) {
+                half2 h23 = __float22half2_rn(make_float2(C_warp[n_out * 8 + 2], C_warp[n_out * 8 + 3]));
+                half2 h67 = __float22half2_rn(make_float2(C_warp[n_out * 8 + 6], C_warp[n_out * 8 + 7]));
+                *reinterpret_cast<uint32_t*>(&C_ptr_base[global_row_2 * OC + global_col_0]) = *reinterpret_cast<uint32_t*>(&h23);
+                *reinterpret_cast<uint32_t*>(&C_ptr_base[global_row_2 * OC + global_col_4]) = *reinterpret_cast<uint32_t*>(&h67);
+            }
+        }
+    } else {
+        // ======================================================================
+        // SPLIT-K PATH: Write fp32 partial sums for later reduction.
+        // Scalar stores acceptable here since reduction kernel aggregates.
+        // ======================================================================
+        float* C = reinterpret_cast<float*>(C_void);
+        float* C_ptr_base = C + static_cast<long long>(blockIdx_z) * M * OC + tile_n * N;
 
-            const int global_row = tile_m * 16 + r_off;
-            const int global_col = n_out * 16 + c_off + warp_id * (N / 2);
-
-            if (global_row < M) {
-                C_ptr_base[global_row * OC + global_col] = C_warp[n_out * 8 + frag_idx];
+        #pragma unroll
+        for (int n_out = 0; n_out < (N / 32); ++n_out) {
+            for (int frag_idx = 0; frag_idx < 8; ++frag_idx) {
+                int r_off, c_off;
+                switch (frag_idx) {
+                    case 0: r_off = r0;     c_off = c0;     break;
+                    case 1: r_off = r0;     c_off = c0 + 1; break;
+                    case 2: r_off = r0 + 2; c_off = c0;     break;
+                    case 3: r_off = r0 + 2; c_off = c0 + 1; break;
+                    case 4: r_off = r0;     c_off = c0 + 4; break;
+                    case 5: r_off = r0;     c_off = c0 + 5; break;
+                    case 6: r_off = r0 + 2; c_off = c0 + 4; break;
+                    case 7: r_off = r0 + 2; c_off = c0 + 5; break;
+                    default: r_off = 0;     c_off = 0;      break;
+                }
+                const int global_row = tile_m * 16 + r_off;
+                const int global_col = n_out * 16 + c_off + warp_id * (N / 2);
+                if (global_row < M) {
+                    C_ptr_base[global_row * OC + global_col] = C_warp[n_out * 8 + frag_idx];
+                }
             }
         }
     }
 }
 
-// ======================================================================================
-// DEQUANTIZE KERNEL: unpack int4 weights to fp16 with scale/zero applied
-// ======================================================================================
+__global__ void __launch_bounds__(256)
+split_k_reduce_kernel(
+    const float* __restrict__ C_split,
+    half* __restrict__ C_out,
+    int M, int OC, int split_k
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < M && col < OC) {
+        float sum = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < split_k; ++i) {
+            sum += C_split[i * M * OC + row * OC + col];
+        }
+        C_out[row * OC + col] = __float2half(sum);
+    }
+}
+
 __global__ void __launch_bounds__(64)
 dequantize_weights(
     int*  __restrict__ B,          // [IC, OC/8] packed int4 weights
@@ -369,7 +423,7 @@ dequantize_weights(
     const uint32_t zeros_raw  = *(uint32_t*)(zeros_ptr2);
     uint4 zero_fp16  = dequantize_s4_to_fp16x2(zeros_raw);
 
-    // Reorder interleaved AWQ qzeros nibbles to sequential layout
+    // Reorder interleaved AWQ qzeros nibbles to sequential layout (export format)
     uint4 zero_fp16_seq;
     asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(zero_fp16_seq.x) : "r"(zero_fp16.x), "r"(zero_fp16.z));
     asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(zero_fp16_seq.y) : "r"(zero_fp16.x), "r"(zero_fp16.z));
@@ -381,7 +435,7 @@ dequantize_weights(
     const uint32_t B_packed   = *(uint32_t*)B_ptr2;
     uint4          B_deq      = dequantize_s4_to_fp16x2(B_packed);
 
-    // Reorder interleaved AWQ qweight nibbles to sequential layout
+    // Reorder interleaved AWQ qweight nibbles to sequential layout (export format)
     uint4 B_deq_seq;
     asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(B_deq_seq.x) : "r"(B_deq.x), "r"(B_deq.z));
     asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(B_deq_seq.y) : "r"(B_deq.x), "r"(B_deq.z));
@@ -457,15 +511,17 @@ torch::Tensor awq_dequantize(
 }
 
 // ======================================================================================
-// LAUNCHER: awq_gemm
+// LAUNCHER: awq_gemm  (with AUTO SPLIT-K, OPT#3)
 // ======================================================================================
 // in_feats:         [M, IC]      fp16
 // kernel:           [IC, OC/8]   int32 (packed int4)
 // scaling_factors:  [IC/G, OC]   fp16
 // zeros:            [IC/G, OC/8] int32 (packed int4)
-// split_k_iters:    K-split factor (final result reduced via .sum(0) in fp32)
+// split_k_iters:    K-split factor. If 0 -> auto-adaptive based on grid size.
 //
-// Returns: [M, OC] fp16 (cast from fp32 intermediate to preserve Split-K precision)
+// Returns: [M, OC] fp16
+//   - split_k == 1: direct fp16 output
+//   - split_k > 1:  fp32 partial sums + custom reduction kernel
 // ======================================================================================
 torch::Tensor awq_gemm(
     torch::Tensor _in_feats,
@@ -474,59 +530,106 @@ torch::Tensor awq_gemm(
     torch::Tensor _zeros,
     int64_t       split_k_iters
 ) {
-    const int num_in_feats    = _in_feats.size(0);
-    const int num_in_channels = _in_feats.size(1);
+    const int M  = _in_feats.size(0);
+    const int IC = _in_feats.size(1);
+    const int OC = _kernel.size(1) * 8;
+    const int G  = IC / _scaling_factors.size(0);
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(_in_feats));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    auto options = torch::TensorOptions()
-                       .dtype(torch::kFloat32)
-                       .device(_in_feats.device());
-    at::Tensor _out_feats =
-        torch::empty({split_k_iters, num_in_feats, _kernel.size(1) * 8}, options);
-
-    const int num_out_feats   = _out_feats.size(-2);
-    const int num_out_channels = _out_feats.size(-1);
-
-    auto in_feats        = reinterpret_cast<half*>(_in_feats.data_ptr<at::Half>());
-    auto kernel          = reinterpret_cast<int*>(_kernel.data_ptr<int>());
-    auto out_feats       = _out_feats.data_ptr<float>();
-    auto scaling_factors = reinterpret_cast<half*>(_scaling_factors.data_ptr<at::Half>());
-    auto zeros           = reinterpret_cast<int*>(_zeros.data_ptr<int>());
-
-    const int group_size = num_in_channels / _scaling_factors.size(0);
+    auto in_feats = reinterpret_cast<half*>(_in_feats.data_ptr<at::Half>());
+    auto kernel   = reinterpret_cast<int*>(_kernel.data_ptr<int>());
+    auto scales   = reinterpret_cast<half*>(_scaling_factors.data_ptr<at::Half>());
+    auto zeros    = reinterpret_cast<int*>(_zeros.data_ptr<int>());
 
     // ==========================================================================
     // Shape validation
     // ==========================================================================
-    TORCH_CHECK(num_out_channels % 64 == 0,  "OC must be a multiple of cta_N = 64");
-    TORCH_CHECK(num_out_channels % 8 == 0,   "OC must be a multiple of pack_num = 8");
-    TORCH_CHECK(group_size % 32 == 0,        "Group size must be a multiple of 32");
-
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(OC % 64 == 0,  "OC must be a multiple of cta_N = 64");
+    TORCH_CHECK(OC % 8 == 0,   "OC must be a multiple of pack_num = 8");
+    TORCH_CHECK(G % 32 == 0,   "Group size must be a multiple of 32");
 
     // ==========================================================================
-    // Dispatch: choose cta_N = 128 or 64 based on OC
+    // Tile configuration
     // ==========================================================================
-    if (num_out_channels % 128 == 0) {
-        const int j_tiles = num_out_channels / 128;
-        dim3 num_blocks((num_out_feats + 16 - 1) / 16 * j_tiles * split_k_iters);
-        dim3 threads_per_block(32, 2);
-        vllm::awq::gemm_forward_4bit_cuda_m16n16k16<128>
-            <<<num_blocks, threads_per_block, 0, stream>>>(
-                group_size, split_k_iters,
-                in_feats, kernel, scaling_factors, zeros,
-                num_in_feats, num_in_channels, num_out_channels, out_feats);
-    } else if (num_out_channels % 64 == 0) {
-        const int j_tiles = num_out_channels / 64;
-        dim3 num_blocks((num_out_feats + 16 - 1) / 16 * j_tiles * split_k_iters);
-        dim3 threads_per_block(32, 2);
-        vllm::awq::gemm_forward_4bit_cuda_m16n16k16<64>
-            <<<num_blocks, threads_per_block, 0, stream>>>(
-                group_size, split_k_iters,
-                in_feats, kernel, scaling_factors, zeros,
-                num_in_feats, num_in_channels, num_out_channels, out_feats);
+    const bool use_n128   = (OC % 128 == 0);
+    const int j_tiles_128 = OC / 128;
+    const int j_tiles_64  = OC / 64;
+    const int j_tiles     = use_n128 ? j_tiles_128 : j_tiles_64;
+    dim3 threads_per_block(32, 2);
+
+    int effective_split_k = static_cast<int>(split_k_iters);
+    if (split_k_iters == 0) {
+        const int m_tiles = (M + 15) / 16;
+        const int base_blocks = m_tiles * j_tiles;
+        constexpr int target_sms = 80;  // V100-SXM2 has 80 SMs
+        if (base_blocks < target_sms) {
+            effective_split_k = (target_sms + base_blocks - 1) / base_blocks;
+            effective_split_k = std::min(effective_split_k, 16);
+        } else {
+            effective_split_k = 1;
+        }
     }
 
-    return _out_feats.sum(0).to(_in_feats.dtype());
+    // ==========================================================================
+    // Dispatch: fast path (split_k=1) or split-k path
+    // ==========================================================================
+    if (effective_split_k == 1) {
+        auto options = torch::TensorOptions()
+                           .dtype(torch::kFloat16)
+                           .device(_in_feats.device());
+        at::Tensor _out_feats = torch::empty({M, OC}, options);
+        auto out_feats = _out_feats.data_ptr<at::Half>();
+
+        dim3 num_blocks((M + 16 - 1) / 16 * j_tiles);
+
+        if (use_n128) {
+            vllm::awq::gemm_forward_4bit_cuda_m16n16k16<128, false>
+                <<<num_blocks, threads_per_block, 0, stream>>>(
+                    G, 1, in_feats, kernel, scales, zeros,
+                    M, IC, OC, out_feats);
+        } else {
+            vllm::awq::gemm_forward_4bit_cuda_m16n16k16<64, false>
+                <<<num_blocks, threads_per_block, 0, stream>>>(
+                    G, 1, in_feats, kernel, scales, zeros,
+                    M, IC, OC, out_feats);
+        }
+        return _out_feats;
+    } else {
+        auto options_fp32 = torch::TensorOptions()
+                                .dtype(torch::kFloat32)
+                                .device(_in_feats.device());
+        at::Tensor _split_feats = torch::empty({effective_split_k, M, OC}, options_fp32);
+        auto split_feats = _split_feats.data_ptr<float>();
+
+        dim3 num_blocks((M + 16 - 1) / 16 * j_tiles * effective_split_k);
+
+        if (use_n128) {
+            vllm::awq::gemm_forward_4bit_cuda_m16n16k16<128, true>
+                <<<num_blocks, threads_per_block, 0, stream>>>(
+                    G, effective_split_k, in_feats, kernel, scales, zeros,
+                    M, IC, OC, split_feats);
+        } else {
+            vllm::awq::gemm_forward_4bit_cuda_m16n16k16<64, true>
+                <<<num_blocks, threads_per_block, 0, stream>>>(
+                    G, effective_split_k, in_feats, kernel, scales, zeros,
+                    M, IC, OC, split_feats);
+        }
+
+        // Custom fast reduction: sum fp32 partials and cast to fp16 in one pass
+        auto options_fp16 = torch::TensorOptions()
+                                .dtype(torch::kFloat16)
+                                .device(_in_feats.device());
+        at::Tensor _out_feats = torch::empty({M, OC}, options_fp16);
+        auto out_feats = reinterpret_cast<half*>(_out_feats.data_ptr<at::Half>());
+
+        dim3 reduce_threads(16, 16);
+        dim3 reduce_blocks((OC + 15) / 16, (M + 15) / 16);
+        vllm::awq::split_k_reduce_kernel
+            <<<reduce_blocks, reduce_threads, 0, stream>>>(
+                split_feats, out_feats, M, OC, effective_split_k);
+
+        return _out_feats;
+    }
 }
